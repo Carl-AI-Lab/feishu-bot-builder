@@ -9,9 +9,10 @@ description: 使用飞书开放平台构建飞书（Lark）机器人和集成的
 
 **技术栈固定决策（不需要询问用户）：**
 - **语言**：Python（除非工作区有明确 Node/Go 信号）
-- **SDK**：`lark-oapi`（飞书官方 Python SDK v2，封装了 Token 管理、事件处理、卡片回调）
-- **Web 框架**：Flask + 官方 `lark_oapi.adapter.flask` 适配器
-- **配置管理**：python-dotenv
+- **SDK**：`lark-oapi`（飞书官方 Python SDK v2，封装 Token 管理、事件处理、卡片回调；会话型机器人可优先评估 `lark_oapi.channel.FeishuChannel`）
+- **HTTP 回调**：Flask + 官方 `lark_oapi.adapter.flask` 适配器；项目已有 FastAPI/Uvicorn 时可手动适配 `RawRequest`
+- **事件接收**：无公网、单实例或快速上线场景优先 WebSocket 长连接；多实例/高可用/统一网关场景优先 HTTP 回调
+- **配置管理**：python-dotenv；所有 token、secret、cookie、模型名走环境变量，不写进代码或文档示例输出
 
 > **关于 "lark" 命名**：`lark-oapi` 是**国内飞书**的官方 SDK，包名和 GitHub 组织（`larksuite`）使用英文品牌名 "Lark"，但 SDK **默认连接国内飞书域名** `https://open.feishu.cn`。如需连接海外 Lark，需在 client builder 中显式设置 `.domain(lark.LARK_DOMAIN)`。本指南所有 URL 和 API 均针对国内飞书。
 
@@ -823,6 +824,13 @@ async def webhook_event(request: Request):
 - [ ] 错误处理覆盖关键路径（API 返回非 success、消息解析异常、外部 API 超时）
 - [ ] `main.py` 入口极简，仅做组装和启动
 
+### 线上验证
+- [ ] WebSocket/HTTP 事件接收真实可用，群聊 `@bot` 后能命中当前机器人而非同名旧 App
+- [ ] 发送接口真实返回 `code=0`，且群里可见回复；权限错误 `99991672` 已按返回的 `permission_violations` 补齐并发布应用版本
+- [ ] 长任务先回 ACK，后台任务完成后分片回传；主事件监听进程不会因下载、转写、LLM 请求阻塞或退出
+- [ ] 媒体类任务用真实链接跑完整链路：下载/字幕、LLM 分析、分片发送、失败提示、job 文件落盘都验证过
+- [ ] 模型配置用官方 API 模型名或网关实际支持的模型名验证过，避免“显示名可读但请求 400”
+
 ---
 
 ## 速查表
@@ -889,6 +897,20 @@ async def webhook_event(request: Request):
 
 content 示例：`{"text": "@_user_1 /daily"}`，其中 `@_user_1` 对应 `mentions[0].key`。
 
+### 长任务媒体工作流经验
+
+处理视频、音频、网页抓取、OCR、转写等长任务时，默认做成**独立工作流服务**，不要把大段中间材料塞进通用 Agent 或长期会话。
+
+- **边界隔离**：会产生完整字幕、日志、抓取正文等大文本的功能，优先独立 App/独立服务/独立容器；只有最终理解、总结、归纳时才调用 LLM，避免污染通用 bot 上下文。
+- **确定性流水线**：下载、解码、转写、清洗、落盘、分片回复写成代码工作流，不依赖通用 skill/agent 临场推理执行固定步骤。推荐链路：`收到命令 -> 去重/鉴权 -> ACK -> 后台任务 -> 下载/提取音频 -> 转写/取字幕 -> 保存完整字幕 -> LLM 分析 -> 分片回传字幕和分析`。
+- **事件处理要短**：飞书 WebSocket/HTTP 回调里只做解析、去重、入队和 ACK；耗时任务进后台线程/队列。长连接/回调处理慢会导致超时、重推或连接不稳。
+- **单 App 单消费者**：同一飞书 App ID/secret 不要同时运行多个 WebSocket 消费者，避免重复消费、抢事件、重复回复。若要绕开 OpenClaw/通用 bot，使用独立 App 凭证和独立机器人。
+- **命令触发保守**：群聊先确认 `mentions` 命中本 bot，再解析命令（如 `/bilisummary <link>`）。可对强特征输入做便利触发（如 `@bot <B站链接/BV号>`），但未知命令不要默认落入大模型自由聊天。
+- **分片与落盘**：完整字幕、长日志、抓取正文必须保存到 job 目录；飞书消息按长度分片发送，回复中带标题、来源 URL、字幕文件路径/任务 ID，便于复核。
+- **媒体下载抗风控**：`yt-dlp` 抓 B 站可能遇到 HTTP 412；先加浏览器 `User-Agent`、`Referer`、`Accept-Language`，并预留 `BILI_COOKIE` / `BILI_COOKIE_FILE`。仍失败时，可按实际项目实现 B 站 API fallback（`view` 取 `cid/title`，`playurl` 取音频流），并在代码里把该路径标为非官方/需回归验证。
+- **转写模型预热**：`faster-whisper` 首次下载模型可能很慢且占内存。设置持久缓存（如 `HF_HOME=/data/hf-cache`、必要时 `HF_ENDPOINT=https://hf-mirror.com`），生产默认从 `small` 起步；`medium/large` 只在资源确认后开启。验证长任务时用一次性容器或 worker，避免压垮正在监听飞书的主进程。
+- **模型名以 API 为准**：不要凭产品名或后缀猜模型 ID。DeepSeek 直连 API 的 V4 1M 模型名是 `deepseek-v4-flash` / `deepseek-v4-pro`，上下文长度由模型本身提供；不要把 `[1m]` 拼进 `model` 字段，除非你接入的是明确要求该后缀的代理网关。
+
 ### 错误码
 
 | 错误码 | 含义 | 解决方案 |
@@ -902,7 +924,14 @@ content 示例：`{"text": "@_user_1 /daily"}`，其中 `@_user_1` 对应 `menti
 
 - **权限配置**：[references/permissions.md](references/permissions.md) — 完整权限目录和常用组合
 - **交互式卡片**：[references/cards.md](references/cards.md) — 卡片 JSON 结构、元素类型、交互处理
-- **官方 SDK**：`pip install lark-oapi` — [GitHub](https://github.com/larksuite/oapi-sdk-python)（v2_main 分支）
+- **官方 Python SDK**：`pip install lark-oapi -U` — [larksuite/oapi-sdk-python](https://github.com/larksuite/oapi-sdk-python)
+- **事件处理**：[处理事件](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/server-side-sdk/python--sdk/handle-events) — 长连接与 HTTP 回调
+- **发送消息**：[发送消息](https://open.feishu.cn/document/server-docs/im-v1/message/create?lang=zh-CN) — `/im/v1/messages`、`receive_id_type`、限频与权限
+- **消息结构**：[发送消息内容结构](https://open.feishu.cn/document/server-docs/im-v1/message-content-description/create_json) / [接收消息内容结构](https://open.feishu.cn/document/server-docs/im-v1/message-content-description/message_content?lang=zh-CN)
+- **权限报错**：[99991672 排查](https://open.feishu.cn/document/faq/trouble-shooting/how-to-fix-the-99991672-error) — 按 `permission_violations` 补权限并发布版本
 - **官方 Demo**：[larksuite/oapi-sdk-python-demo](https://github.com/larksuite/oapi-sdk-python-demo) — 完整机器人示例
-- **官方文档**：[open.feishu.cn/document](https://open.feishu.cn/document)（飞书）| [open.larksuite.com/document](https://open.larksuite.com/document)（Lark）
+- **模型核对**：[DeepSeek Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing/) / [List Models](https://api-docs.deepseek.com/api/list-models) — V4 直连模型 ID 与 1M context
+- **本地转写**：[SYSTRAN/faster-whisper](https://github.com/SYSTRAN/faster-whisper) — WhisperModel、模型大小、设备与缓存
+- **媒体下载**：[yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp)；B 站 412 可参考 [yt-dlp issue #5083](https://github.com/yt-dlp/yt-dlp/issues/5083)
+- **官方文档入口**：[open.feishu.cn/document](https://open.feishu.cn/document)（飞书）| [open.larksuite.com/document](https://open.larksuite.com/document)（Lark）
 - **卡片搭建工具**：[open.feishu.cn/tool/cardbuilder](https://open.feishu.cn/tool/cardbuilder) — 可视化卡片 JSON 编辑器
