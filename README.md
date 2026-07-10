@@ -60,3 +60,5 @@ cp -r feishu-bot-builder/ ~/.claude/skills/feishu-bot-builder/
 ## 许可证
 
 [Apache-2.0](LICENSE)
+
+谢谢
